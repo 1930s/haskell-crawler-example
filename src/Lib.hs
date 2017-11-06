@@ -1,4 +1,6 @@
+{-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 module Lib
   ( runSample,
@@ -11,11 +13,14 @@ import           Network.URI
 import           Network.Wreq               (get, responseBody)
 
 import           Data.List                  (intercalate, isPrefixOf)
+import qualified Data.List                  as L
 import           Data.List.Split            (splitOn)
-import           Data.Maybe                 (fromMaybe, mapMaybe, isJust, fromJust)
-import           Data.Set                   (Set, deleteAt, difference, elemAt,
-                                             empty, fromList, insert, null,
-                                             singleton, union)
+import           Data.Maybe                 (fromJust, fromMaybe, isJust,
+                                             mapMaybe)
+import qualified Data.Set                   as S (Set, delete, deleteAt,
+                                                  difference, elemAt, empty,
+                                                  fromList, insert, null,
+                                                  singleton, toList, union)
 
 import           Data.Text.Format           (Only (..), print)
 
@@ -23,27 +28,32 @@ import           System.Directory           (createDirectoryIfMissing)
 import           System.FilePath.Posix      (dropDrive, (</>))
 
 import qualified Control.Exception          as E
-import           Control.Lens
+import           Control.Lens               ((^.))
 import           Control.Monad              (when)
 
 import qualified Data.ByteString.Lazy.Char8 as BS
 
-import qualified Text.HTML.TagSoup as TS
+import qualified Text.HTML.TagSoup          as TS
 
+import           Control.Concurrent
+import           Control.Concurrent.Async
 import           Prelude                    hiding (null, print)
 
 -- | current state of crawling
 data CrawlerState = CrawlerState
-  { linksPending :: Set URI
-  , linksCrawlin :: Set URI
-  , linksVisited :: Set URI
+  { linksPending :: [URI] -- TODO use Seq here?
+  , linksCrawlin :: S.Set URI
+  , linksVisited :: S.Set URI
   } deriving (Show)
 
+-- | crawler configuration
 data Configuration = Configuration
-  { startUri :: URI
+  { startUri         :: URI
   , concurrencyLevel :: Int
   , visitedLinkLimit :: Int
   }
+
+type AsyncJob = Async (URI, S.Set URI)
 
 runSample :: IO ()
 runSample = do
@@ -58,50 +68,99 @@ runSample = do
 
 -- | perform crawling, starting with rootUri
 runCrawl :: Configuration -> IO ()
-runCrawl cfg = do
-  print "start crawling from {}\n" (Only $ show $ startUri cfg)
-  print "concurrency level: {}, visited link limit: {}\n" (concurrencyLevel cfg, visitedLinkLimit cfg)
+runCrawl cfg@Configuration{..} = do
+  print "start crawling from {}\n" (Only $ show startUri)
+  print "concurrency level: {}, visited link limit: {}\n" (concurrencyLevel, visitedLinkLimit)
 
   let state = CrawlerState {
-    linksPending = singleton $ startUri cfg,
-    linksCrawlin = empty,
-    linksVisited = empty
+    linksPending = [startUri],
+    linksCrawlin = S.empty,
+    linksVisited = S.empty
   }
 
-  newState <- crawlLoop cfg state
+  CrawlerState{linksVisited} <- crawlThreaded cfg state
 
-  print "Done. {} links visited.\n" (Only $ length $ linksVisited newState)
+  print "Done. {} links visited.\n" (Only $ length linksVisited)
 
+-- | crawl using threaded implementation
+crawlThreaded :: Configuration -> CrawlerState -> IO CrawlerState
+crawlThreaded = crawlLoopThreaded []
+
+crawlLoopThreaded :: [AsyncJob] -> Configuration -> CrawlerState -> IO CrawlerState
+crawlLoopThreaded jobs cfg@Configuration{..} state@CrawlerState{..}
+  -- nothing more to do
+  | L.null linksPending && S.null linksCrawlin = return state
+  -- we've hit visited link limit
+  | length linksVisited > visitedLinkLimit   = return state
+  -- limit concurrency or wait for more work to do
+  | L.null linksPending || L.length jobs > concurrencyLevel = do
+          (job, (lnk, crawled)) <- waitAny jobs
+
+          let newState = visitedOne lnk crawled state
+
+          crawlLoopThreaded (L.delete job jobs) cfg newState
+  -- just schedule another one
+  | otherwise = do
+          let (lnk, newState) = popOneFromPending state
+
+          job <- async $ crawlLink lnk
+
+          crawlLoopThreaded (job : jobs) cfg newState
+
+
+-- | single threaded implementation
 crawlLoop :: Configuration -> CrawlerState -> IO CrawlerState
-crawlLoop cfg state = do
-  newState <- crawlOne state
-  if null (linksPending newState) || length (linksVisited newState) > (visitedLinkLimit cfg)
+crawlLoop cfg@Configuration{..} state = do
+  newState@CrawlerState{..} <- crawlOne state
+  if L.null linksPending || length linksVisited  > visitedLinkLimit
     then return newState
     else crawlLoop cfg newState
 
 crawlOne :: CrawlerState -> IO CrawlerState
-crawlOne state =
-  if null pending
+crawlOne state@CrawlerState{linksPending} =
+  if L.null linksPending
     then return state
     else do
-      let lnk = elemAt 0 pending
-          visited = linksVisited state
+      let (lnk, newState) = popOneFromPending state
 
+      (_, links) <- crawlLink lnk
+
+      return $ visitedOne lnk links state
+
+-- | pop one link from pending into crawling
+popOneFromPending :: CrawlerState -> (URI, CrawlerState)
+popOneFromPending state@CrawlerState{linksPending, linksCrawlin} =
+    (lnk, newState)
+  where
+    lnk : otherPending = linksPending
+    newState = state {
+          linksPending = otherPending,
+          linksCrawlin = S.insert lnk linksCrawlin
+    }
+
+-- | mark one link as completed and process crawling results
+visitedOne :: URI -> S.Set URI -> CrawlerState -> CrawlerState
+visitedOne lnk crawledLinks state@CrawlerState{..} =
+      state {
+        linksVisited = S.insert lnk linksVisited,
+        linksPending = linksPending ++ filter (isNewLink state) (S.toList crawledLinks),
+        linksCrawlin = S.delete lnk linksCrawlin
+      }
+
+isNewLink :: CrawlerState -> URI -> Bool
+isNewLink CrawlerState{..} lnk =
+  lnk `notElem` linksVisited &&
+  lnk `notElem` linksPending &&
+  lnk `notElem` linksCrawlin
+
+-- | crawl the link
+crawlLink :: URI -> IO (URI, S.Set URI)
+crawlLink lnk = do
       page <- getPage lnk `E.catch` handler
       dumpPageToFile lnk page
-      links <- getLinksFromPage lnk page
-
-      let newVisited = insert lnk visited
-          newPending = deleteAt 0 pending
-          linksWithoutVisited = difference links newVisited
-          linksWithoutPending = difference linksWithoutVisited newPending
-
-      return state {
-        linksVisited = newVisited,
-        linksPending = newPending `union` linksWithoutPending
-      }
+      crawled <- getLinksFromPage lnk page
+      return (lnk, crawled)
   where
-    pending = linksPending state
     handler :: HttpException -> IO BS.ByteString
     handler e = do
       print "{}" (Only $ show e)
@@ -114,20 +173,21 @@ getPage uri = do
   return $ r ^. responseBody
 
 -- | Retrieves all the outgoing links from a web page
-getLinksFromPage :: URI -> BS.ByteString -> IO (Set URI)
-getLinksFromPage uri body = do
-  let tags = TS.parseTags body
-      as = filter (TS.isTagOpenName "a") tags
-      hrefs = map (TS.fromAttrib "href") as
-      links = mapMaybe (transformToAbsolute uri) hrefs
-      isOutgoing link = uriPath uri /= uriPath link
-      sameDomain link = fromMaybe False (fromSameDomain uri link)
-      filteredLinks = filter (\link -> isOutgoing link && sameDomain link) links
+getLinksFromPage :: URI -> BS.ByteString -> IO (S.Set URI)
+getLinksFromPage uri body =
+    -- convert to Set and remove duplicates
+    return $ S.fromList filteredLinks
+  where
+    isOutgoing link = uriPath uri /= uriPath link
+    sameDomain link = fromMaybe False (fromSameDomain uri link)
 
-  -- leave out only outgoing links
-  return $ fromList filteredLinks
+    tags = TS.parseTags body
+    as = filter (TS.isTagOpenName "a") tags
+    hrefs = map (TS.fromAttrib "href") as
+    links = mapMaybe (transformToAbsolute uri) hrefs
 
---  mapM_ print filteredLinks
+    filteredLinks = filter (\link -> isOutgoing link && sameDomain link) links
+
 fromSameDomain :: URI -> URI -> Maybe Bool
 fromSameDomain one two = do
   authOne <- uriAuthority one
@@ -144,6 +204,7 @@ transformToAbsolute baseUri linkStr = do
 
 baseOutputDir = "output"
 
+-- | dump raw page bytes to file
 dumpPageToFile :: URI -> BS.ByteString -> IO ()
 dumpPageToFile pageUri body = do
   let (dirName, fileName) = uriToDirAndFileName pageUri
@@ -151,8 +212,6 @@ dumpPageToFile pageUri body = do
       outputFile = outputDir </> fileName
   createDirectoryIfMissing True outputDir
   BS.writeFile outputFile body
-
-  putStrLn $ "writted to disk: " ++ (show pageUri)
 
 uriToDirAndFileName :: URI -> (FilePath, FilePath)
 uriToDirAndFileName uri =
