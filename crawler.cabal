@@ -21,8 +21,6 @@ library
                      , directory
                      , filepath
                      , split
-                     , HandsomeSoup
-                     , hxt
                      , wreq
                      , http-client
                      , lens
@@ -33,7 +31,6 @@ library
                      , xml-conduit
                      , tagsoup
                      , async
-                     , async-pool
   default-language:    Haskell2010
 
 executable crawler-exe
